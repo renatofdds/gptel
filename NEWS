@@ -33,6 +33,11 @@
 ** New features and UI changes
 ** Notable bug fixes
 
+- Org mode: Generated lines beginning with stars, for example in
+  reasoning or code blocks, no longer turn into Org headlines.
+  Code lines escaped inside generated source blocks are restored
+  when the prompt is rebuilt.
+
 - Non UTF-8 characters or raw bytes in tool call results are replaced
   with a readable placeholder, ensuring that the tool call loop can
   continue uninterrupted.
