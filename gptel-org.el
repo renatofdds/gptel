@@ -58,6 +58,7 @@
 (declare-function gptel--get-buffer-bounds "gptel")
 (declare-function gptel--restore-props "gptel")
 (declare-function org-entry-get "org")
+(declare-function org-escape-code-in-region "org-src")
 (declare-function org-entry-put "org")
 (declare-function org-with-wide-buffer "org-macs" nil t)
 (declare-function org-set-property "org")
@@ -284,7 +285,7 @@ depend on the value of `gptel-org-branching-context', which see."
                        do (insert-buffer-substring org-buf start end)
                        (goto-char (point-min)))
               (goto-char (point-max))
-              (gptel-org--unescape-tool-results)
+              (gptel-org--unescape-generated-code)
               (gptel-org--strip-block-headers)
               (when-let* ((gptel-org-ignore-elements ;not copied by -with-buffer-copy
                            (buffer-local-value 'gptel-org-ignore-elements
@@ -304,7 +305,7 @@ depend on the value of `gptel-org-branching-context', which see."
       (let ((org-buf (current-buffer))
             (beg (point-min)))
         (gptel--with-buffer-copy org-buf beg prompt-end
-          (gptel-org--unescape-tool-results)
+          (gptel-org--unescape-generated-code)
           (gptel-org--strip-block-headers)
           (when-let* ((gptel-org-ignore-elements ;not copied by -with-buffer-copy
                        (buffer-local-value 'gptel-org-ignore-elements
@@ -363,10 +364,10 @@ This removal is necessary to avoid auto-mimicry by LLMs."
       (delete-region (match-beginning 0)
                      (min (point-max) (1+ (line-end-position)))))))
 
-(defun gptel-org--unescape-tool-results ()
-  "Undo escapes done to keep results from escaping blocks.
-Scans backward for gptel tool text property, then unescapes the block
-contents."
+(defun gptel-org--unescape-generated-code ()
+  "Undo escapes done to keep generated content from escaping blocks.
+Scans backward for gptel text properties, then unescapes generated
+tool results and responses."
   (save-excursion
     (goto-char (point-max))
     (let ((prev-pt (point)))
@@ -375,11 +376,13 @@ contents."
          (previous-single-char-property-change (point) 'gptel))
         (let ((prop (get-text-property (point) 'gptel))
               (backward-progress (point)))
-          (when (eq (car-safe prop) 'tool)
+          (when (or (eq prop 'response)
+                    (eq (car-safe prop) 'tool))
             ;; User edits to clean up can potentially insert a tool-call header
             ;; that is propertized.  Tool call headers should not be
             ;; propertized.
-            (when (looking-at-p "[[:space:]]*#\\+begin_tool")
+            (when (and (eq (car-safe prop) 'tool)
+                       (looking-at "[[:space:]]*#\\+begin_tool"))
               (goto-char (match-end 0)))
             ;; TODO this code is able to put the point behind prev-pt, which
             ;; makes the region inverted.  The `max' catches this, but really
@@ -711,22 +714,49 @@ elements."
       (pcase (match-string 0)
         ;; Handle backticks
         ((and (guard (eq (char-before) ?`)) ticks)
-         (gptel--replace-source-marker (length ticks))
-         (save-match-data
-           (catch 'block-end
-             (while (search-forward ticks nil t)
-               (unless (or (eq (char-before (match-beginning 0)) ?`)
-                           (eq (char-after) ?`))
-                 (gptel--replace-source-marker (length ticks) 'end)
-                 (throw 'block-end nil))))))
+         (let ((block-p (and (= (length ticks) 3)
+                             (save-excursion
+                               (beginning-of-line)
+                               (skip-chars-forward " \t")
+                               (= (point) (match-beginning 0))))))
+           (gptel--replace-source-marker (length ticks))
+           (let ((content-start (point))
+                 (end-marker nil))
+             (save-match-data
+               (catch 'block-end
+                 (while (search-forward ticks nil t)
+                   (unless (or (eq (char-before (match-beginning 0)) ?`)
+                               (eq (char-after) ?`))
+                     (setq end-marker (copy-marker (match-beginning 0)))
+                     (gptel--replace-source-marker (length ticks) 'end)
+                     (throw 'block-end nil)))))
+             (when block-p
+               (org-escape-code-in-region
+                content-start (or end-marker (point-max))))
+             (when end-marker (set-marker end-marker nil)))))
         ;; Handle headings
         ((and (guard (eq (char-before) ?#)) heading)
          (cond
           ((looking-at "[[:space:]]")   ;Handle headings
            (delete-region (line-beginning-position) (point))
            (insert (make-string (length heading) ?*)))
-          ((looking-at "\\+begin_src") ;Overeager LLM switched to using Org src blocks
-           (save-match-data (re-search-forward "^#\\+end_src" nil t)))))
+          ((save-excursion
+             (goto-char (line-beginning-position))
+             (looking-at "^#\\+begin_src\\(?:[ \t]\\|$\\)")) ;Overeager LLM switched to using Org src blocks
+           (let ((content-start (line-end-position)))
+             (save-match-data
+               (if (re-search-forward "^[ \t]*#\\+end_src\\(?:[ \t]\\|$\\)" nil t)
+                   (org-escape-code-in-region content-start (match-beginning 0))
+                 (org-escape-code-in-region content-start (point-max))))))))
+        ;; Handle line-leading star runs as list bullets
+        ((and (guard (and (eq (char-after (match-beginning 0)) ?*)
+                          (save-excursion
+                            (goto-char (match-beginning 0))
+                            (and (bolp) (looking-at "\\*+[ \t\n]")))))
+              _)
+         (goto-char (match-beginning 0))
+         (looking-at "\\*+")
+         (replace-match "-"))
         ;; Handle emphasis
         ("**" (cond
                ;; ((looking-at "\\*\\(?:[[:word:]]\\|\s\\)")
@@ -775,6 +805,25 @@ This is intended for use in the markdown to org stream converter."
         (insert (if end "#+end_src" "#+begin_src "))
       (insert "="))))
 
+(defun gptel-org--escape-code-line ()
+  "Prepend a comma to the current line, after leading whitespace.
+This keeps the line from being interpreted as Org syntax inside a
+source block."
+  (save-excursion
+    (goto-char (line-beginning-position))
+    (skip-chars-forward " \t")
+    (insert ",")))
+
+(defun gptel-org--partial-keyword-p (keyword)
+  "Return non-nil if the text at point is a proper prefix of KEYWORD.
+This is used to defer parsing a possible keyword that is split
+across stream chunks."
+  (let* ((len (length keyword))
+         (end (min (point-max) (+ (point) len)))
+         (text (buffer-substring-no-properties (point) end)))
+    (and (< (length text) len)
+         (string-prefix-p text keyword))))
+
 ;;;###autoload
 (defun gptel--stream-convert-markdown->org (start-marker)
   "Return a Markdown to Org converter.
@@ -807,8 +856,43 @@ cleaning up after."
           (when (marker-position start-pt) (goto-char start-pt))
           (when in-src-block (setq ticks ticks-total))
           (save-excursion
-            (while (re-search-forward "`\\|\\*\\{1,2\\}\\|_\\|^#+" nil t)
+            (while (re-search-forward
+                    (concat "`\\|^[ \t]*,+[*#]\\|^[ \t]*,+\\|^[ \t]+\\*+\\|^\\*+\\|"
+                            "\\*\\{1,2\\}\\|_\\|^#+\\|^[ \t]+#+\\|^[ \t]+\\'")
+                    nil t)
               (pcase (match-string 0)
+                ;; Comma-escape lines that already start with commas
+                ((and (guard (and in-src-block
+                                  (save-excursion
+                                    (goto-char (match-beginning 0))
+                                    (looking-at "^[ \t]*,+[*#]"))))
+                      _)
+                 (gptel-org--escape-code-line))
+                ;; Defer comma prefixes that end at the chunk boundary
+                ((and (guard (and in-src-block
+                                  (save-excursion
+                                    (goto-char (match-beginning 0))
+                                    (looking-at "^[ \t]*,+"))))
+                      _)
+                 (when (eobp)
+                   (setq noop-p t) (set-marker start-pt (match-beginning 0))))
+                ;; Defer leading whitespace that ends at the chunk boundary
+                ((and (guard (and in-src-block
+                                  (save-excursion
+                                    (goto-char (match-beginning 0))
+                                    (looking-at "^[ \t]+\\'"))))
+                      _)
+                 (setq noop-p t) (set-marker start-pt (match-beginning 0)))
+                ;; Comma-escape indented star lines inside src blocks, or
+                ;; rewind to process them as emphasis or bullets outside.
+                ((and (guard (save-excursion
+                               (goto-char (match-beginning 0))
+                               (looking-at "^[ \t]+\\*")))
+                      _)
+                 (if in-src-block
+                     (gptel-org--escape-code-line)
+                   (goto-char (match-beginning 0))
+                   (skip-chars-forward " \t")))
                 ("`"
                  ;; Count number of consecutive backticks
                  (backward-char)
@@ -839,27 +923,64 @@ cleaning up after."
                     ;; Negative number of ticks or in a src block already,
                     ;; reset ticks
                     (t (setq ticks ticks-total)))))
-                ;; Handle headings and misguided #+begin_src text
-                ((and (guard (and (eq (char-before) ?#) (or (not in-src-block) in-org-src-block)))
-                      heading)
-                 (if in-org-src-block
-                     ;; If we are inside an Org-style src block, look for #+end_src
-                     (cond
-                      ((< (- (point-max) (point)) 8) ;not enough information to close Org src block
-                       (setq noop-p t) (set-marker start-pt (match-beginning 0)))
-                      ((looking-at "\\+end_src") ;Close Org src block
-                       (setq in-src-block nil in-org-src-block nil)))
-                   ;; Otherwise check for Markdown headings, or for #+begin_src
+                ;; Comma-escape star lines inside src blocks
+                ((and (guard (and in-src-block
+                                  (eq (char-after (match-beginning 0)) ?*)
+                                  (save-excursion
+                                    (goto-char (match-beginning 0)) (bolp))))
+                      _)
+                 (gptel-org--escape-code-line))
+                ;; Handle headings, keywords and misguided #+begin_src text
+                ((and (guard (eq (char-before) ?#)) heading)
+                 (cond
+                  (in-src-block
                    (cond
-                    ((eobp)       ; Not enough information about the heading yet
+                    ((eobp)     ; Not enough information about the line yet
                      (setq noop-p t) (set-marker start-pt (match-beginning 0)))
-                    ((looking-at "[[:space:]]") ; Convert markdown heading to Org heading
-                     (delete-region (line-beginning-position) (point))
-                     (insert (make-string (length heading) ?*)))
-                    ((< (- (point-max) (point)) 11) ;Not enough information to check if Org src block
+                    ((not (looking-at "\\+")) nil) ;Ordinary "#" text in code
+                    ((not in-org-src-block)    ;Comma-escape Markdown fence contents
+                     (gptel-org--escape-code-line))
+                    ((gptel-org--partial-keyword-p "+end_src")
+                     ;; Not enough information to close Org src block
                      (setq noop-p t) (set-marker start-pt (match-beginning 0)))
-                    ((looking-at "\\+begin_src ") ;Overeager LLM switched to using Org src blocks
-                     (setq in-src-block t in-org-src-block t)))))
+                    ((save-excursion
+                       (goto-char (line-beginning-position))
+                       (looking-at "^[ \t]*#\\+end_src\\(?:[ \t\n]\\|$\\)")) ;Close Org src block
+                     (setq in-src-block nil in-org-src-block nil))
+                    (t (gptel-org--escape-code-line))))
+                  ;; Otherwise check for Markdown headings, or for #+begin_src
+                  ((not (eq (char-after (match-beginning 0)) ?#))
+                   nil)                 ;Indented line, not a heading or block start
+                  ((eobp)       ; Not enough information about the heading yet
+                   (setq noop-p t) (set-marker start-pt (match-beginning 0)))
+                  ((looking-at "[[:space:]]") ; Convert markdown heading to Org heading
+                   (delete-region (line-beginning-position) (point))
+                   (insert (make-string (length heading) ?*)))
+                  ((gptel-org--partial-keyword-p "+begin_src")
+                   ;; Not enough information to check if Org src block
+                   (setq noop-p t) (set-marker start-pt (match-beginning 0)))
+                  ((save-excursion
+                     (goto-char (line-beginning-position))
+                     (looking-at "^[ \t]*#\\+begin_src\\(?:[ \t\n]\\|$\\)")) ;Overeager LLM switched to using Org src blocks
+                   (setq in-src-block t in-org-src-block t))))
+                ;; Defer line-leading star runs that end at the chunk boundary
+                ((and (guard (and (not in-src-block)
+                                  (eq (char-after (match-beginning 0)) ?*)
+                                  (save-excursion
+                                    (goto-char (match-beginning 0))
+                                    (and (bolp) (looking-at "\\*+\\'")))))
+                      _)
+                 (setq noop-p t) (set-marker start-pt (match-beginning 0)))
+                ;; Replace line-leading star runs with list bullets
+                ((and (guard (and (not in-src-block)
+                                  (eq (char-after (match-beginning 0)) ?*)
+                                  (save-excursion
+                                    (goto-char (match-beginning 0))
+                                    (and (bolp) (looking-at "\\*+[ \t\n]")))))
+                      _)
+                 (goto-char (match-beginning 0))
+                 (looking-at "\\*+")
+                 (replace-match "-"))
                 ;; Handle other chars: emphasis, bold and bullet items
                 ((and "**" (guard (not in-src-block)))
                  (cond
