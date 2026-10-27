@@ -246,7 +246,7 @@ list of strings (system prompt + conversation template) or a function
 returning a string or list of strings.  See `gptel-system-prompt' for
 details."
   :safe #'always
-  :type '(alist :key-type symbol :value-type string))
+  :type '(alist :key-type symbol :value-type (choice string function)))
 
 (define-obsolete-variable-alias 'gptel--system-message 'gptel-system-prompt
   "0.9.9.6")
